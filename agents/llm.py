@@ -1,0 +1,724 @@
+# This file is based on TheAIScientist repo:ai_scientist/llm.py with some modifications to support the openrouter api
+#   TheAIScientist url: https://github.com/SakanaAI/AI-Scientist
+
+import json
+import os
+import re
+
+import anthropic
+import backoff
+import openai
+import google.generativeai as genai
+from google.generativeai.types import GenerationConfig
+
+MAX_NUM_TOKENS = 8192
+
+# Native Anthropic clients (Messages API). Current Claude models (e.g. Opus 5.5) always think,
+# and thinking counts toward max_tokens, so these calls stream with a larger cap; they also
+# reject temperature, so depth is set via output_config.effort instead.
+CLAUDE_MAX_TOKENS = 64000
+CLAUDE_EFFORT = os.environ.get("FMLBENCH_CLAUDE_EFFORT", "high")
+ANTHROPIC_CLIENTS = (anthropic.Anthropic, anthropic.AnthropicBedrock, anthropic.AnthropicVertex)
+
+AVAILABLE_PROVIDERS = [
+    "OpenRouter",
+    "OpenAI",
+    "AnthropicBedrock",
+    "OpenAIBedrock",
+    "VLLM",
+]
+
+# OpenAI models on Amazon Bedrock (e.g. us.openai.gpt-6-astra) go through the Converse API.
+# Same output cap as Claude; reasoning depth is set via reasoning.effort
+# (none/low/medium/high/xhigh/max), default high to match CLAUDE_EFFORT.
+BEDROCK_MAX_TOKENS = 64000
+BEDROCK_EFFORT = os.environ.get("FMLBENCH_BEDROCK_EFFORT", "high")
+
+
+class BedrockConverseClient:
+    """boto3 bedrock-runtime; credentials come from the standard AWS chain.
+
+    Every call gets a new botocore client, so pooled connections are never reused. Idle
+    connections get dropped silently on the network path, and a request sent on one waits
+    for the kernel's TCP retransmission timeout (~15 min) before botocore retries.
+    """
+
+    def __init__(self, region):
+        import boto3
+        from botocore.config import Config
+        self.region = region
+        self._session = boto3.Session(region_name=region)
+        self._config = Config(read_timeout=3600, retries={"max_attempts": 8, "mode": "adaptive"})
+
+    @property
+    def runtime(self):
+        return self._session.client("bedrock-runtime", config=self._config)
+
+
+# Self-hosted models behind a vLLM OpenAI-compatible server (e.g. deepseek-v4.1-flash-1017).
+# Same output cap as Claude/Bedrock. Thinking and its depth go through chat_template_kwargs;
+# the DeepSeek-V4.1 template takes reasoning_effort as an int in [1, 100] or a name
+# (low=50, high=75, max=100), default high to match CLAUDE_EFFORT.
+VLLM_BASE_URL = os.environ.get("FMLBENCH_VLLM_BASE_URL", "http://localhost:8000/v1")
+VLLM_MAX_TOKENS = 64000
+VLLM_THINKING = os.environ.get("FMLBENCH_VLLM_THINKING", "true").lower() not in ("0", "false", "no", "off")
+VLLM_EFFORT = os.environ.get("FMLBENCH_VLLM_EFFORT", "high")
+VLLM_EFFORT = int(VLLM_EFFORT) if VLLM_EFFORT.isdigit() else VLLM_EFFORT
+
+
+class VLLMChatClient:
+    """OpenAI SDK pointed at a vLLM server; the key comes from VLLM_API_KEY.
+
+    Every call gets a new OpenAI client, so pooled connections are never reused (same idle
+    connection problem as BedrockConverseClient when the server is reached across regions).
+    """
+
+    def __init__(self, base_url, api_key):
+        self.base_url = base_url
+        self.api_key = api_key
+
+    def new_openai(self):
+        return openai.OpenAI(base_url=self.base_url, api_key=self.api_key, timeout=3600, max_retries=8)
+
+
+def is_anthropic_client(client) -> bool:
+    return isinstance(client, ANTHROPIC_CLIENTS)
+
+
+def is_bedrock_converse_client(client) -> bool:
+    return isinstance(client, BedrockConverseClient)
+
+
+def is_vllm_client(client) -> bool:
+    return isinstance(client, VLLMChatClient)
+
+
+def vllm_chat_create(client, model, system_message, messages):
+    """One chat.completions call on the vLLM server; messages use the OpenAI format."""
+    template_kwargs = {"thinking": VLLM_THINKING}
+    if VLLM_THINKING:
+        template_kwargs["reasoning_effort"] = VLLM_EFFORT
+    with client.new_openai() as oai:
+        response = oai.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system_message}, *messages],
+            max_tokens=VLLM_MAX_TOKENS,
+            extra_body={"chat_template_kwargs": template_kwargs},
+        )
+    if response.choices[0].finish_reason == "length":
+        print(f"Warning: vLLM response truncated at max_tokens={VLLM_MAX_TOKENS}")
+    return response
+
+
+def vllm_response_text(response) -> str:
+    # The server's reasoning parser moves the thinking into reasoning_content; keep the answer only.
+    return response.choices[0].message.content or ""
+
+
+def bedrock_converse_create(client, model, system_message, messages):
+    """One Converse call; messages use the Converse format. Returns the response dict."""
+    response = client.runtime.converse(
+        modelId=model,
+        system=[{"text": system_message}],
+        messages=messages,
+        inferenceConfig={"maxTokens": BEDROCK_MAX_TOKENS},
+        additionalModelRequestFields={"reasoning": {"effort": BEDROCK_EFFORT}},
+    )
+    stop_reason = response.get("stopReason")
+    if stop_reason in ("guardrail_intervened", "content_filtered"):
+        raise RuntimeError(f"Bedrock blocked the response: stopReason={stop_reason}")
+    if stop_reason == "max_tokens":
+        print(f"Warning: Bedrock response truncated at maxTokens={BEDROCK_MAX_TOKENS}")
+    return response
+
+
+def bedrock_response_text(response) -> str:
+    return "".join(b["text"] for b in response["output"]["message"]["content"] if "text" in b)
+
+
+def claude_messages_create(client, model, system_message, messages):
+    """One Messages API call on a native Anthropic client; returns the final Message."""
+    with client.messages.stream(
+        model=model,
+        max_tokens=CLAUDE_MAX_TOKENS,
+        system=system_message,
+        messages=messages,
+        output_config={"effort": CLAUDE_EFFORT},
+    ) as stream:
+        response = stream.get_final_message()
+    if response.stop_reason == "refusal":
+        raise RuntimeError(f"Claude declined the request: {getattr(response, 'stop_details', None)}")
+    if response.stop_reason == "max_tokens":
+        print(f"Warning: Claude response truncated at max_tokens={CLAUDE_MAX_TOKENS}")
+    return response
+
+
+def claude_response_text(response) -> str:
+    return "".join(b.text for b in response.content if b.type == "text")
+
+AVAILABLE_LLMS = [
+    # Anthropic models
+    "claude-3-5-sonnet-20240620",
+    "claude-3-5-sonnet-20241022",
+    # OpenAI models
+    "gpt-4o-mini",
+    "gpt-4o-mini-2024-07-18",
+    "gpt-4o",
+    "gpt-4o-2024-05-13",
+    "gpt-4o-2024-08-06",
+    "gpt-4.1",
+    "gpt-4.1-2025-04-14",
+    "gpt-4.1-mini",
+    "gpt-4.1-mini-2025-04-14",
+    "gpt-4.1-nano",
+    "gpt-4.1-nano-2025-04-14",
+    "o1",
+    "o1-2024-12-17",
+    "o1-preview-2024-09-12",
+    "o1-mini",
+    "o1-mini-2024-09-12",
+    "o3-mini",
+    "o3-mini-2025-01-31",
+    "gpt-5-2025-08-07",
+    # OpenRouter models
+    "llama3.1-405b",
+    "openai/gpt-4o-mini-2024-07-18",
+    # Anthropic Claude models via Amazon Bedrock
+    "bedrock/anthropic.claude-3-sonnet-20240229-v1:0",
+    "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
+    "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
+    "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+    "bedrock/anthropic.claude-3-opus-20240229-v1:0",
+    # Anthropic Claude models Vertex AI
+    "vertex_ai/claude-3-opus@20240229",
+    "vertex_ai/claude-3-5-sonnet@20240620",
+    "vertex_ai/claude-3-5-sonnet-v2@20241022",
+    "vertex_ai/claude-3-sonnet@20240229",
+    "vertex_ai/claude-3-haiku@20240307",
+    # DeepSeek models
+    "deepseek-chat",
+    "deepseek-coder",
+    "deepseek-reasoner",
+    # Google Gemini models
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash-thinking-exp-01-21",
+    "gemini-2.5-pro-preview-03-25",
+    "gemini-2.5-pro-exp-03-25",
+    "gemini-2.5-pro",
+    # Qwen models
+    "qwen/qwen3-235b-a22b-2507",
+    # DeepSeek models via OpenRouter
+    "deepseek/deepseek-v3.2",
+]
+
+
+def extract_usage_info(response) -> dict:
+    """Extract token usage information from LLM response"""
+    usage_info = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0
+    }
+    
+    # Extract from Bedrock Converse response (a dict; outputTokens include reasoning)
+    if isinstance(response, dict) and "usage" in response:
+        usage = response["usage"]
+        usage_info["prompt_tokens"] = (usage.get("inputTokens", 0) + usage.get("cacheReadInputTokens", 0)
+                                       + usage.get("cacheWriteInputTokens", 0))
+        usage_info["completion_tokens"] = usage.get("outputTokens", 0)
+        usage_info["total_tokens"] = usage_info["prompt_tokens"] + usage_info["completion_tokens"]
+
+    # Extract from Anthropic Messages response (usage has input_tokens/output_tokens)
+    elif hasattr(response, 'usage') and hasattr(response.usage, 'input_tokens'):
+        usage = response.usage
+        usage_info["prompt_tokens"] = (usage.input_tokens + (usage.cache_read_input_tokens or 0)
+                                       + (usage.cache_creation_input_tokens or 0))
+        usage_info["completion_tokens"] = usage.output_tokens
+        usage_info["total_tokens"] = usage_info["prompt_tokens"] + usage.output_tokens
+
+    # Extract from OpenAI/OpenRouter response
+    elif hasattr(response, 'usage'):
+        usage = response.usage
+        usage_info["prompt_tokens"] = getattr(usage, 'prompt_tokens', 0)
+        usage_info["completion_tokens"] = getattr(usage, 'completion_tokens', 0)
+        usage_info["total_tokens"] = getattr(usage, 'total_tokens', 0)
+    
+    # Extract from Anthropic response
+    elif hasattr(response, 'input_tokens') and hasattr(response, 'output_tokens'):
+        usage_info["prompt_tokens"] = response.input_tokens
+        usage_info["completion_tokens"] = response.output_tokens
+        usage_info["total_tokens"] = response.input_tokens + response.output_tokens
+    
+    return usage_info
+
+
+# Get N responses from a single message, used for ensembling.
+@backoff.on_exception(backoff.expo, (openai.RateLimitError, openai.APITimeoutError))
+def get_batch_responses_from_llm(
+        msg,
+        client,
+        model,
+        system_message,
+        print_debug=False,
+        msg_history=None,
+        temperature=0.75,
+        n_responses=1,
+):
+    if msg_history is None:
+        msg_history = []
+
+    if 'gpt' in model and not (is_bedrock_converse_client(client) or is_vllm_client(client)):
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        if 'gpt-5' in model:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    *new_msg_history,
+                ],
+                temperature=1, #
+                max_completion_tokens=MAX_NUM_TOKENS, # higher max tokens (8192) to avoid "Failed to extract JSON from LLM output" problem
+                n=n_responses,
+                stop=None,
+                seed=0,
+            )
+        else:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    *new_msg_history,
+                ],
+                temperature=temperature,
+                max_tokens=MAX_NUM_TOKENS,
+                n=n_responses,
+                stop=None,
+                seed=0,
+            )
+        content = [r.message.content for r in response.choices]
+        new_msg_history = [
+            new_msg_history + [{"role": "assistant", "content": c}] for c in content
+        ]
+        
+        # Extract usage info
+        usage_info = extract_usage_info(response)
+        
+    elif model == "llama-3-1-405b-instruct":
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        response = client.chat.completions.create(
+            model="meta-llama/llama-3.1-405b-instruct",
+            messages=[
+                {"role": "system", "content": system_message},
+                *new_msg_history,
+            ],
+            temperature=temperature,
+            max_tokens=MAX_NUM_TOKENS,
+            n=n_responses,
+            stop=None,
+        )
+        content = [r.message.content for r in response.choices]
+        new_msg_history = [
+            new_msg_history + [{"role": "assistant", "content": c}] for c in content
+        ]
+        
+        # Extract usage info
+        usage_info = extract_usage_info(response)
+    else:
+        content, new_msg_history = [], []
+        total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        
+        for _ in range(n_responses):
+            c, hist, usage = get_response_from_llm(
+                msg,
+                client,
+                model,
+                system_message,
+                print_debug=False,
+                msg_history=None,
+                temperature=temperature,
+            )
+            content.append(c)
+            new_msg_history.append(hist)
+            total_usage["prompt_tokens"] += usage["prompt_tokens"]
+            total_usage["completion_tokens"] += usage["completion_tokens"]
+            total_usage["total_tokens"] += usage["total_tokens"]
+        
+        usage_info = total_usage
+
+    if print_debug:
+        print()
+        print("*" * 20 + " LLM START " + "*" * 20)
+        for j, msg in enumerate(new_msg_history[0]):
+            print(f'{j}, {msg["role"]}: {msg["content"]}')
+        print(content)
+        print("*" * 21 + " LLM END " + "*" * 21)
+        print()
+
+    return content, new_msg_history, usage_info
+
+
+@backoff.on_exception(backoff.expo, (openai.RateLimitError, openai.APITimeoutError))
+def get_response_from_llm(
+        msg,
+        client,
+        model,
+        system_message,
+        print_debug=False,
+        msg_history=None,
+        temperature=0.75,
+):
+    if msg_history is None:
+        msg_history = []
+
+    if is_bedrock_converse_client(client):
+        # Converse-format history; only the text is kept for replay (reasoning is not passed back).
+        new_msg_history = msg_history + [{"role": "user", "content": [{"text": msg}]}]
+        response = bedrock_converse_create(client, model, system_message, new_msg_history)
+        content = bedrock_response_text(response)
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": [{"text": content}]}]
+    elif is_vllm_client(client):
+        # OpenAI-format history; only the answer is kept for replay (reasoning is not passed back).
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        response = vllm_chat_create(client, model, system_message, new_msg_history)
+        content = vllm_response_text(response)
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+    elif "claude" in model:
+        # Fork by client type: OpenRouter/OpenAI-compatible clients (openai.OpenAI)
+        # don't have `client.messages.create`, so route them through
+        # chat.completions.create. Anthropic-native clients keep the original path.
+        if isinstance(client, openai.OpenAI):
+            new_msg_history = msg_history + [{"role": "user", "content": msg}]
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    *new_msg_history,
+                ],
+                temperature=temperature,
+                max_tokens=MAX_NUM_TOKENS,
+                n=1,
+                stop=None,
+            )
+            content = response.choices[0].message.content
+            new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+        else:
+            new_msg_history = msg_history + [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": msg,
+                        }
+                    ],
+                }
+            ]
+            response = claude_messages_create(client, model, system_message, new_msg_history)
+            content = claude_response_text(response)
+            # Keep the full assistant content (incl. thinking blocks) so multi-turn replays
+            # pass thinking back unchanged, as the API requires.
+            new_msg_history = new_msg_history + [
+                {
+                    "role": "assistant",
+                    "content": [b.model_dump(exclude_none=True) for b in response.content],
+                }
+            ]
+    elif 'gpt' in model:
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        if 'gpt-5' in model:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    *new_msg_history,
+                ],
+                temperature=1, # default
+                max_completion_tokens=MAX_NUM_TOKENS, # higher max tokens to avoid "Failed to extract JSON from LLM output" problem
+                n=1,
+                stop=None,
+                seed=0,
+            )
+        else:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    *new_msg_history,
+                ],
+                temperature=temperature,
+                max_tokens=MAX_NUM_TOKENS,
+                n=1,
+                stop=None,
+                seed=0,
+            )
+        content = response.choices[0].message.content
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+    elif "o1" in model or "o3" in model:
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "user", "content": system_message},
+                *new_msg_history,
+            ],
+            temperature=1,
+            max_completion_tokens=MAX_NUM_TOKENS,
+            n=1,
+            seed=0,
+        )
+        content = response.choices[0].message.content
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+    elif model in ["meta-llama/llama-3.1-405b-instruct", "llama-3-1-405b-instruct"]:
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        response = client.chat.completions.create(
+            model="meta-llama/llama-3.1-405b-instruct",
+            messages=[
+                {"role": "system", "content": system_message},
+                *new_msg_history,
+            ],
+            temperature=temperature,
+            max_tokens=MAX_NUM_TOKENS,
+            n=1,
+            stop=None,
+        )
+        content = response.choices[0].message.content
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+    elif model in ["deepseek-chat", "deepseek-coder"]:
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_message},
+                *new_msg_history,
+            ],
+            temperature=temperature,
+            max_tokens=MAX_NUM_TOKENS,
+            n=1,
+            stop=None,
+        )
+        content = response.choices[0].message.content
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+    elif model in ["deepseek-reasoner"]:
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_message},
+                *new_msg_history,
+            ],
+            n=1,
+            stop=None,
+        )
+        content = response.choices[0].message.content
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+    elif "deepseek" in model:
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_message},
+                *new_msg_history,
+            ],
+            temperature=temperature,
+            max_tokens=MAX_NUM_TOKENS,
+            n=1,
+            stop=None,
+        )
+        content = response.choices[0].message.content
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+    elif "qwen" in model:
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_message},
+                *new_msg_history,
+            ],
+            max_tokens=MAX_NUM_TOKENS,
+        )
+        content = response.choices[0].message.content
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+    elif "gemini" in model:
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_message},
+                *new_msg_history,
+            ],
+            temperature=temperature,
+            max_tokens=MAX_NUM_TOKENS,  # higher max tokens to avoid truncated response problem in gemini
+            n=1,
+        )
+        content = response.choices[0].message.content
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+    else:
+        raise ValueError(f"Model {model} not supported.")
+
+    # Extract usage info
+    usage_info = extract_usage_info(response)
+
+    if print_debug:
+        print()
+        print("*" * 20 + " LLM START " + "*" * 20)
+        for j, msg in enumerate(new_msg_history):
+            print(f'{j}, {msg["role"]}: {msg["content"]}')
+        print(content)
+        print("*" * 21 + " LLM END " + "*" * 21)
+        print()
+
+    return content, new_msg_history, usage_info
+
+
+def extract_json_between_markers(llm_output):
+    # Regular expression pattern to find JSON content between ```json and ```
+    json_pattern = r"```json(.*?)```"
+    matches = re.findall(json_pattern, llm_output, re.DOTALL)
+
+    if not matches:
+        # Fallback: Try to find any JSON-like content in the output
+        json_pattern = r"\{.*?\}"
+        matches = re.findall(json_pattern, llm_output, re.DOTALL)
+
+    for json_string in matches:
+        json_string = json_string.strip()
+        try:
+            parsed_json = json.loads(json_string)
+            return parsed_json
+        except json.JSONDecodeError:
+            # Attempt to fix common JSON issues
+            try:
+                # Remove invalid control characters
+                json_string_clean = re.sub(r"[\x00-\x1F\x7F]", "", json_string)
+                parsed_json = json.loads(json_string_clean)
+                return parsed_json
+            except json.JSONDecodeError:
+                continue  # Try next match
+    return None  # No valid JSON found
+
+
+# Original version. It can not specify the provider
+# def create_client(model):
+#     if model.startswith("claude-"):
+#         print(f"Using Anthropic API with model {model}.")
+#         return anthropic.Anthropic(), model
+#     elif model.startswith("bedrock") and "claude" in model:
+#         client_model = model.split("/")[-1]
+#         print(f"Using Amazon Bedrock with model {client_model}.")
+#         return anthropic.AnthropicBedrock(), client_model
+#     elif model.startswith("vertex_ai") and "claude" in model:
+#         client_model = model.split("/")[-1]
+#         print(f"Using Vertex AI with model {client_model}.")
+#         return anthropic.AnthropicVertex(), client_model
+#     elif 'gpt' in model or "o1" in model or "o3" in model:
+#         print(f"Using OpenAI API with model {model}.")
+#         return openai.OpenAI(), model
+#     elif model in ["deepseek-chat", "deepseek-reasoner", "deepseek-coder"]:
+#         print(f"Using OpenAI API with {model}.")
+#         return openai.OpenAI(
+#             api_key=os.environ["DEEPSEEK_API_KEY"],
+#             base_url="https://api.deepseek.com"
+#         ), model
+#     elif model == "llama3.1-405b":
+#         print(f"Using OpenAI API with {model}.")
+#         return openai.OpenAI(
+#             api_key=os.environ["OPENROUTER_API_KEY"],
+#             base_url="https://openrouter.ai/api/v1"
+#         ), "meta-llama/llama-3.1-405b-instruct"
+#     elif "gemini" in model:
+#         print(f"Using OpenAI API with {model}.")
+#         return openai.OpenAI(
+#             api_key=os.environ["GEMINI_API_KEY"],
+#             base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+#         ), model
+#     else:
+#         raise ValueError(f"Model {model} not supported.")
+    
+
+def create_client(model, provider='OpenAI'):
+
+    # Check whether the provider is in the valid list
+    provider_list = ['OpenRouter', 'Anthropic', 'AnthropicBedrock', 'AnthropicVertex', 'OpenAI', 'OpenAIBedrock', 'VLLM', 'DeepSeek', 'Google']
+    if provider not in provider_list:
+        raise ValueError(f"Provided {provider} not supported. Supported provides: 'OpenRouter', 'Anthropic', 'AnthropicBedrock', 'AnthropicVertex', 'OpenAI', 'OpenAIBedrock', 'VLLM', 'DeepSeek', 'Google'")
+
+
+    if provider == 'OpenRouter':
+        print(f"Using OpenRouter API with {model}.")
+        return openai.OpenAI(
+            api_key=os.environ["OPENROUTER_API_KEY"],
+            base_url="https://openrouter.ai/api/v1"
+        ), model
+
+    elif provider == 'OpenAI':
+        print(f"Using OpenAI API with model {model}.")
+        return openai.OpenAI(), model
+
+    elif provider == 'Google':
+        print(f"Using Google Gemini (OpenAI-compatible) with model {model}.")
+        return openai.OpenAI(
+            api_key=os.environ["GEMINI_API_KEY"],
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+        ), model
+
+    elif provider == 'AnthropicBedrock':
+        # Credentials come from the standard AWS chain (env vars, profile, or instance role).
+        # model is a Bedrock inference-profile ID, e.g. us.anthropic.claude-opus-5-5
+        region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
+        print(f"Using Amazon Bedrock ({region}) with model {model}.")
+        return anthropic.AnthropicBedrock(aws_region=region, max_retries=8), model
+
+    elif provider == 'OpenAIBedrock':
+        # model is a Bedrock inference-profile ID, e.g. us.openai.gpt-6-astra
+        region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
+        print(f"Using Amazon Bedrock Converse ({region}) with model {model}.")
+        return BedrockConverseClient(region), model
+
+    elif provider == 'VLLM':
+        # model is the server's --served-model-name, e.g. deepseek-v4.1-flash-1017
+        if not os.environ.get("VLLM_API_KEY"):
+            raise ValueError("Provider VLLM needs VLLM_API_KEY (the server's --api-key).")
+        print(f"Using vLLM server {VLLM_BASE_URL} with model {model}.")
+        return VLLMChatClient(VLLM_BASE_URL, os.environ["VLLM_API_KEY"]), model
+
+    else:
+        raise NotImplementedError(f"Provider {provider} not implemented.")
+
+    
+    if model.startswith("claude-"):
+        print(f"Using Anthropic API with model {model}.")
+        return anthropic.Anthropic(), model
+    elif model.startswith("bedrock") and "claude" in model:
+        client_model = model.split("/")[-1]
+        print(f"Using Amazon Bedrock with model {client_model}.")
+        return anthropic.AnthropicBedrock(), client_model
+    elif model.startswith("vertex_ai") and "claude" in model:
+        client_model = model.split("/")[-1]
+        print(f"Using Vertex AI with model {client_model}.")
+        return anthropic.AnthropicVertex(), client_model
+    elif 'gpt' in model or "o1" in model or "o3" in model:
+        print(f"Using OpenAI API with model {model}.")
+        return openai.OpenAI(), model
+    elif model in ["deepseek-chat", "deepseek-reasoner", "deepseek-coder"]:
+        print(f"Using OpenAI API with {model}.")
+        return openai.OpenAI(
+            api_key=os.environ["DEEPSEEK_API_KEY"],
+            base_url="https://api.deepseek.com"
+        ), model
+    elif model == "llama3.1-405b":
+        print(f"Using OpenAI API with {model}.")
+        return openai.OpenAI(
+            api_key=os.environ["OPENROUTER_API_KEY"],
+            base_url="https://openrouter.ai/api/v1"
+        ), "meta-llama/llama-3.1-405b-instruct"
+    elif "gemini" in model:
+        print(f"Using OpenAI API with {model}.")
+        return openai.OpenAI(
+            api_key=os.environ["GEMINI_API_KEY"],
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+        ), model
+    else:
+        raise ValueError(f"Model {model} not supported.")
